@@ -1,11 +1,12 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include "http_server.h"
+
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/tcp.h>
 
 #include "http_parser.h"
-#include "http_server.h"
 
 #define CRLF "\r\n"
 
@@ -39,6 +40,19 @@ struct http_request {
     int complete;
 };
 
+struct server_service {
+    bool is_stopped;
+    struct list_head worker;
+};
+
+struct khttp_worker {
+    struct socket *sock;
+    struct list_head list;
+    struct work_struct khttp_work;
+};
+
+struct server_service daemon = {.is_stopped = false};
+extern struct workqueue_struct *wq;
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
     struct kvec iov = {.iov_base = (void *) buf, .iov_len = size};
@@ -141,8 +155,10 @@ static int http_parser_callback_message_complete(http_parser *parser)
     return 0;
 }
 
-static int http_server_worker(void *arg)
+static void http_server_worker(struct work_struct *work)
 {
+    struct khttp_worker *worker =
+        container_of(work, struct khttp_worker, khttp_work);
     char *buf;
     struct http_parser parser;
     struct http_parser_settings setting = {
@@ -154,21 +170,18 @@ static int http_server_worker(void *arg)
         .on_body = http_parser_callback_body,
         .on_message_complete = http_parser_callback_message_complete};
     struct http_request request;
-    struct socket *socket = (struct socket *) arg;
-
-    allow_signal(SIGKILL);
-    allow_signal(SIGTERM);
+    struct socket *socket = worker->sock;
 
     buf = kmalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
     if (!buf) {
         pr_err("can't allocate memory!\n");
-        return -1;
+        return;
     }
 
     request.socket = socket;
     http_parser_init(&parser, HTTP_REQUEST);
     parser.data = &request;
-    while (!kthread_should_stop()) {
+    while (!daemon.is_stopped) {
         int ret = http_server_recv(socket, buf, RECV_BUFFER_SIZE - 1);
         if (ret <= 0) {
             if (ret)
@@ -180,19 +193,50 @@ static int http_server_worker(void *arg)
             break;
     }
     kernel_sock_shutdown(socket, SHUT_RDWR);
-    sock_release(socket);
     kfree(buf);
-    return 0;
+    return;
 }
+
+static struct work_struct *create_work(struct socket *sk)
+{
+    struct khttp_worker *work;
+
+    if (!(work = kmalloc(sizeof(struct khttp_worker), GFP_KERNEL)))
+        return NULL;
+
+    work->sock = sk;
+
+    INIT_WORK(&work->khttp_work, http_server_worker);
+
+    list_add(&work->list, &daemon.worker);
+
+    return &work->khttp_work;
+}
+
+static void free_work(void)
+{
+    struct khttp_worker *l, *tar;
+    /* cppcheck-suppress uninitvar */
+
+    list_for_each_entry_safe (tar, l, &daemon.worker, list) {
+        kernel_sock_shutdown(tar->sock, SHUT_RDWR);
+        flush_work(&tar->khttp_work);
+        sock_release(tar->sock);
+        kfree(tar);
+    }
+}
+
 
 int http_server_daemon(void *arg)
 {
     struct socket *socket;
-    struct task_struct *worker;
     struct http_server_param *param = (struct http_server_param *) arg;
+    struct work_struct *work;
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
+
+    INIT_LIST_HEAD(&daemon.worker);
 
     while (!kthread_should_stop()) {
         int err = kernel_accept(param->listen_socket, &socket, 0);
@@ -202,11 +246,15 @@ int http_server_daemon(void *arg)
             pr_err("kernel_accept() error: %d\n", err);
             continue;
         }
-        worker = kthread_run(http_server_worker, socket, KBUILD_MODNAME);
-        if (IS_ERR(worker)) {
+        work = create_work(socket);
+        if (IS_ERR(work)) {
             pr_err("can't create more worker process\n");
             continue;
         }
+        queue_work(wq, work);
     }
+    daemon.is_stopped = true;
+    free_work();
+    pr_info("http_server_daemon returns\n");
     return 0;
 }
